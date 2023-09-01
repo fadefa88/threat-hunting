@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 
+  V1 Hunting challenge
+Parameters:
+  LatestWAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base'
+    Description: (Windows AMI ID) DO NOT CHANGE THIS VALUE  
+  LatestLAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+    Description: (Linux AMI ID) DO NOT CHANGE THIS VALUE
+  QSS3BucketName:
+    AllowedPattern: ^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$
+    ConstraintDescription: Quick Start bucket name can include numbers, lowercase
+      letters, uppercase letters, and hyphens (-). It cannot start or end with a hyphen
+      (-).
+    Default: techday-2023-1
+    Description: S3 bucket name for the Quick Start assets. Quick Start bucket name
+      can include numbers, lowercase letters, uppercase letters, and hyphens (-).
+      It cannot start or end with a hyphen (-).
+    Type: String
+  QSS3KeyPrefix:
+    AllowedPattern: ^[0-9a-zA-Z-/.]*$
+    ConstraintDescription: Quick Start key prefix can include numbers, lowercase letters,
+      uppercase letters, hyphens (-), dots(.) and forward slash (/).
+    Default: latest/challenges
+    Description: S3 key prefix for the Quick Start assets. Quick Start key prefix
+      can include numbers, lowercase letters, uppercase letters, hyphens (-), dots(.) and
+      forward slash (/).
+    Type: String
+Resources:
+  DemoVPC: 
+    Type: AWS::EC2::VPC
+    Properties: 
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+  DemoSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: DemoVPC
+    Properties:
+      VpcId: !Ref DemoVPC
+      CidrBlock: 10.0.128.0/24
+  DemoNATElasticIPAddress:
+    Type: AWS::EC2::EIP
+    DependsOn: DemoVPC
+    Properties:
+      Domain: DemoVPC
+  DemoNATGateway:
+   Type: AWS::EC2::NatGateway
+   DependsOn: 
+   - DemoNATElasticIPAddress
+   - DemoSubnet
+   Properties:
+     AllocationId: !GetAtt DemoNATElasticIPAddress.AllocationId
+     SubnetId: !Ref DemoSubnet
+  DemoInternetGateway:
+    Type: AWS::EC2::InternetGateway
+  DemoRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: DemoInternetGateway
+    Properties:
+      VpcId: !Ref DemoVPC
+  DemoAttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn: DemoInternetGateway
+    Properties:
+      VpcId: !Ref DemoVPC
+      InternetGatewayId: !Ref DemoInternetGateway
+  DemoRoute:
+    Type: AWS::EC2::Route
+    DependsOn: DemoInternetGateway
+    Properties:
+      RouteTableId: !Ref DemoRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref DemoInternetGateway
+  DemoSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref DemoRouteTable
+      SubnetId: !Ref DemoSubnet
+  SecurityGroupWindows: 
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: DemoVPC
+    Properties:
+      GroupDescription: WindowsClient
+      VpcId:
+        Ref: DemoVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3389
+        ToPort: 3389
+        CidrIp: 0.0.0.0/0
+  SecurityGroupServerC2: 
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: DemoVPC
+    Properties:
+      GroupDescription: Allow connection to ServerC2
+      VpcId:
+        Ref: DemoVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      #- IpProtocol: tcp
+      #  FromPort: 443
+      #  ToPort: 443
+      #  CidrIp: 0.0.0.0/0
+  WindowsClient:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: m4.large
+      NetworkInterfaces:
+      - DeviceIndex: "0"
+        AssociatePublicIpAddress: "true"
+        DeleteOnTermination: "true"
+        SubnetId: !Ref DemoSubnet
+        PrivateIpAddress: 10.0.128.5
+        GroupSet:
+        - !GetAtt SecurityGroupWindows.GroupId
+      ImageId: !Ref "LatestWAmiId"
+      Tags:
+        - Key: "Name"
+          Value: "WindowsClient"
+      UserData:
+        Fn::Base64:
+          !Sub |
+            <powershell>
+            # Disable Defender 
+            Set-MpPreference -DisableRealtimeMonitoring $true -DisableScriptScanning $true -DisableBehaviorMonitoring $true -DisableIOAVProtection $true -DisableIntrusionPreventionSystem $true
+            Start-Sleep -Seconds 2
+            Set-ExecutionPolicy Unrestricted -Force
+            Start-Sleep -Seconds 2
+            Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False
+            Start-Sleep -Seconds 2
+            
+            # Disable Password Complexity
+            secedit /export /cfg c:\secpol.cfg
+            (gc C:\secpol.cfg).replace("PasswordComplexity = 1", "PasswordComplexity = 0") | Out-File C:\secpol.cfg
+            secedit /configure /db c:\windows\security\local.sdb /cfg c:\secpol.cfg /areas SECURITYPOLICY
+            rm -force c:\secpol.cfg -confirm:$false
+
+            # Google Chrome Installation
+            Invoke-WebRequest 'http://dl.google.com/chrome/install/375.126/chrome_installer.exe' -OutFile c:\chrome.exe
+            Start-Sleep -Seconds 25
+            Invoke-Expression "c:\chrome.exe /silent /install"
+            Start-Sleep -Seconds 25
+
+            #Associate PDF File extension
+            Ftype Acrobat.Document.DC=C:\Program Files\Google\Chrome\Application\chrome.exe
+                      
+            # Create User for all Tasks
+            & NET USER techday2023 techday2023 /add /y /expires:never
+            & NET USER exfil exfil /add /y /expires:never
+            & NET USER rogue1 rogue1 /add /y /expires:never
+            & NET LOCALGROUP Administrators techday2023 /add
+            & NET LOCALGROUP Administrators rogue1 /add
+            & NET LOCALGROUP Administrators exfil /add
+            Start-Sleep -Seconds 2 
+
+            # Create Folder for Task2 - Exfil
+            New-Item -Path "c:\project\" -Name "confidential" -ItemType "directory"
+            New-Item -Path "c:\project\" -ItemType Directory
+            New-SmbShare -Name "project" -Path "c:\project" -FullAccess "Everyone","Guests","Anonymous Logon"
+            Grant-SmbShareAccess -Name "project" -AccountName "Everyone" -AccessRight Full -Force
+            Start-Sleep -Seconds 2  
+            
+            # Create Folder for Task2 - Temp
+            New-Item -Path "c:\temporary\" -ItemType Directory
+            New-SmbShare -Name "temporary" -Path "c:\temporary" -FullAccess "Everyone","Guests","Anonymous Logon"
+            Grant-SmbShareAccess -Name "project" -AccountName "Everyone" -AccessRight Full -Force
+            Start-Sleep -Seconds 2 
+
+            # Create second Folder for Task2, Task3
+            
+            New-Item -Path "c:\Tasks\" -Name "Task2" -ItemType "directory"
+            New-Item -Path "c:\Tasks\" -Name "Task3" -ItemType "directory"
+           
+            New-Item -Path "c:\Tasks\" -ItemType Directory
+            New-SmbShare -Name "Tasks" -Path "c:\Tasks" -FullAccess "Everyone","Guests","Anonymous Logon"
+            Grant-SmbShareAccess -Name "Tasks" -AccountName "Everyone" -AccessRight Full -Force
+            Start-Sleep -Seconds 2  
+            
+            # Download File for Task2 - Exfil - USE YOUR GITHUB TOKEN
+            $env:GITHUB_TOKEN="YOURGITHUBTOKEN"
+            $URL="https://raw.githubusercontent.com/YOURGITHUBURL"
+            $PATH="c:\project\confidential\confidential.txt"
+            Invoke-WebRequest -URI $URL -Headers @{Authorization = "Bearer $env:GITHUB_TOKEN"} -OutFile $PATH
+            Start-Sleep -Seconds 2
+
+            #Install 7Z
+            Invoke-WebRequest "https://www.7-zip.org/a/7z2201-x64.exe" -Outfile c:\Tasks\Task2\7z2201-x64.exe
+            Start-Sleep -Seconds 5
+            cd "\Tasks\Task2"
+            c:\Tasks\Task2\7z2201-x64.exe /S
+            Start-Sleep -Seconds 3
+                                                      
+            # Unzip File - Download second File for Task2 - Exfil
+            $env:GITHUB_TOKEN="YOURGITHUBTOKEN"
+            $URL="https://raw.githubusercontent.com/YOURGITHUBURL"
+            $PATH4="c:\Tasks\Task2\Document.pdf.zip"
+            Invoke-WebRequest -URI $URL4 -Headers @{Authorization = "Bearer $env:GITHUB_TOKEN"} -OutFile $PATH4
+            Start-Sleep -Seconds 3
+                        
+            # Create Folder for Task3 - Dump
+            New-Item -Path "c:\temp\" -ItemType Directory
+            New-SmbShare -Name "temp" -Path "c:\temp" -FullAccess "Everyone","Guests","Anonymous Logon"
+            Grant-SmbShareAccess -Name "project" -AccountName "Everyone" -AccessRight Full -Force
+            Start-Sleep -Seconds 3 
+            
+            # Download File for Task3 - Dump
+            $env:GITHUB_TOKEN="YOURGITHUBTOKEN"
+            $URL="https://raw.githubusercontent.com/YOURGITHUBURL"
+            $PATH="c:\Tasks\Task3\document_task3.pdf.zip"
+            Invoke-WebRequest -URI $URL -Headers @{Authorization = "Bearer $env:GITHUB_TOKEN"} -OutFile $PATH
+            Start-Sleep -Seconds 3
+            
+            
+
+            cd "\Program Files\7-Zip"
+            .\7z.exe x c:\Tasks\Task2\Document.pdf.zip -aoa -ppassword
+            .\7z.exe x c:\Tasks\Task3\Document_task3.pdf.zip -aoa -ppassword
+            
+            cp .\Document.pdf.exe c:\Tasks\Task2
+            cp .\Document_task3.pdf.exe c:\Tasks\Task3
+            
+            Start-Sleep -Seconds 2
+            del c:\Tasks\Task2\Document.pdf.zip
+            del c:\Tasks\Task3\Document_task3.pdf.zip
+        
+            del c:\Tasks\Task2\7z2201-x64.exe
+            
+            </powershell>  
+  ServerC2:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: m4.large
+      NetworkInterfaces:
+      - DeviceIndex: "0"
+        AssociatePublicIpAddress: "true"
+        DeleteOnTermination: "true"
+        SubnetId: !Ref DemoSubnet
+        PrivateIpAddress: 10.0.128.11
+        GroupSet:
+        - !GetAtt SecurityGroupServerC2.GroupId  
+      ImageId: !Ref 'LatestLAmiId'
+      Tags:
+      - Key: "Name"
+        Value: "ServerC2"
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            apt-get update -y
+            apt-get install apache2 -y   
+            apt-get install unzip -y  
+            apt install p7zip-full -y
+            useradd -p exfil exfil
+            usermod -aG sudo exfil         
+            
+            curl -u username:ghp_YOURGITHUBDOWNLOADUSER -l https://raw.githubusercontent.com/YOURGITHUBURL/payload_dump.zip > /var/www/html/payload_dump.zip
+            curl -u username:ghp_YOURGITHUBDOWNLOADUSER -l https://raw.githubusercontent.com/YOURGITHUBURL/task2.zip > /var/www/html/task2.zip
+          
+                                  
+            cd /var/www/html
+            unzip -Ppassword /var/www/html/task2.zip 
+            unzip -Ppassword /var/www/html/payload_dump.zip 
+            
+            
+
+            
+Outputs:
+  WindowsPublicDNSName:
+    Description: Use this IP address to access the Windows Client using RDP (Username and Password = techday2023).
+    Value: !GetAtt WindowsClient.PublicDnsName
+  WindowsPublicIP:
+    Description: Use this IP address to access the Windows Client using RDP (Username and Password = techday2023).
+    Value: !GetAtt WindowsClient.PublicIp
+  ServerC2PublicIP:
+    Description: Use this IP address to access the Server C2 using HTTP <IP:80>.
+    Value: !GetAtt ServerC2.PublicIp
